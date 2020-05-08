@@ -23,6 +23,7 @@
 
 #include "camera_sensor.h"
 #include "device_enumerator.h"
+#include "dma-heaps.h"
 #include "ipa_manager.h"
 #include "media_device.h"
 #include "pipeline_handler.h"
@@ -30,7 +31,6 @@
 #include "utils.h"
 #include "v4l2_controls.h"
 #include "v4l2_videodevice.h"
-#include "vcsm.h"
 
 namespace libcamera {
 
@@ -298,7 +298,7 @@ public:
 		 * size.
 		 */
 		if (lsTable_) {
-			vcsm_.free(lsTable_);
+			dmaheap_.free(lsTable_);
 			lsTable_ = nullptr;
 		}
 
@@ -329,8 +329,8 @@ public:
 	/* Buffers passed to the IPA. */
 	std::vector<IPABuffer> ipaBuffers_;
 
-	/* VCSM allocation helper. */
-	RPi::Vcsm vcsm_;
+	/* DMAHEAP allocation helper. */
+	RPi::Dmaheap dmaheap_;
 	void *lsTable_;
 
 	RPi::StaggeredCtrl staggeredCtrl_;
@@ -968,22 +968,22 @@ int PipelineHandlerRPi::configureIPA(Camera *camera)
 	entityControls.emplace(0, data->unicam_[Unicam::Image].dev()->controls());
 	entityControls.emplace(1, data->isp_[Isp::Input].dev()->controls());
 
-	/* Allocate the lens shading table via vcsm and pass to the IPA. */
+	/* Allocate the lens shading table via dmaheap and pass to the IPA. */
 	if (!data->lsTable_) {
-		data->lsTable_ = data->vcsm_.alloc("ls_grid", MAX_LS_GRID_SIZE);
+		data->lsTable_ = data->dmaheap_.alloc("ls_grid", MAX_LS_GRID_SIZE);
 		uintptr_t ptr = reinterpret_cast<uintptr_t>(data->lsTable_);
 
 		if (!data->lsTable_)
 			return -ENOMEM;
 
 		/*
-		 * The vcsm allocation will always be in the memory region
+		 * The dmaheap allocation will always be in the memory region
 		 * < 32-bits to allow Videocore to access the memory.
 		 */
 		IPAOperationData op;
 		op.operation = RPI_IPA_EVENT_LS_TABLE_ALLOCATION;
 		op.data = { static_cast<uint32_t>(ptr & 0xffffffff),
-			    data->vcsm_.getVCHandle(data->lsTable_) };
+			    data->dmaheap_.getHandle(data->lsTable_) };
 		data->ipa_->processEvent(op);
 	}
 

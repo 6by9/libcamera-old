@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2019, Raspberry Pi (Trading) Limited
  *
- * vcsm.h - Helper class for vcsm allocations.
+ * dma-heap.h - Helper class for dma-heap allocations.
  */
 #pragma once
 
@@ -10,40 +10,47 @@
 #include <mutex>
 
 #include <fcntl.h>
-#include <linux/vc_sm_cma_ioctl.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-heap.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 namespace RPi {
 
-#define VCSM_CMA_DEVICE_NAME "/dev/vcsm-cma"
+// /dev/dma-heap/linux,cma is the dma-heap allocator, which allows dmaheap-cma to
+// only have to worry about importing.
+// Annoyingly, should the cma heap size be specified on the kernel command line
+// instead of DT, the heap gets named "reserved" instead.
+#define DMA_HEAP_CMA_NAME  "/dev/dma_heap/linux,cma"
+#define DMA_HEAP_CMA_ALT_NAME  "/dev/dma_heap/reserved"
 
-class Vcsm
+class Dmaheap
 {
 public:
-	Vcsm()
+	Dmaheap()
 	{
-		vcsmHandle_ = ::open(VCSM_CMA_DEVICE_NAME, O_RDWR, 0);
-		if (vcsmHandle_ == -1) {
-			std::cerr << "Could not open vcsm device: "
-				  << VCSM_CMA_DEVICE_NAME;
+		dmaheapHandle_ = ::open(DMA_HEAP_CMA_NAME, O_RDWR, 0);
+		if (dmaheapHandle_ == -1) {
+			dmaheapHandle_ = ::open(DMA_HEAP_CMA_ALT_NAME, O_RDWR, 0);
+			if (dmaheapHandle_ == -1) {
+				std::cerr << "Could not open dmaheap device";
+			}
 		}
 	}
 
-	~Vcsm()
+	~Dmaheap()
 	{
 		/* Free all existing allocations. */
 		auto it = allocMap_.begin();
 		while (it != allocMap_.end())
 			it = remove(it->first);
 
-		if (vcsmHandle_)
-			::close(vcsmHandle_);
+		if (dmaheapHandle_)
+			::close(dmaheapHandle_);
 	}
 
-	void *alloc(const char *name, unsigned int size,
-		    vc_sm_cma_cache_e cache = VC_SM_CMA_CACHE_NONE)
+	void *alloc(const char *name, unsigned int size)
 	{
 		unsigned int pageSize = getpagesize();
 		void *user_ptr;
@@ -52,36 +59,34 @@ public:
 		/* Ask for page aligned allocation. */
 		size = (size + pageSize - 1) & ~(pageSize - 1);
 
-		struct vc_sm_cma_ioctl_alloc alloc;
+		struct dma_heap_allocation_data alloc;
+
 		memset(&alloc, 0, sizeof(alloc));
-		alloc.size = size;
-		alloc.num = 1;
-		alloc.cached = cache;
-		alloc.handle = 0;
-		if (name != NULL)
-			memcpy(alloc.name, name, 32);
+		alloc.len = size,
+		alloc.fd_flags = O_CLOEXEC,
 
-		ret = ::ioctl(vcsmHandle_, VC_SM_CMA_IOCTL_MEM_ALLOC, &alloc);
+		ret = ::ioctl(dmaheapHandle_, DMA_HEAP_IOCTL_ALLOC, &alloc);
 
-		if (ret < 0 || alloc.handle < 0) {
-			std::cerr << "vcsm allocation failure for "
+		if (ret < 0) {
+			std::cerr << "dmaheap allocation failure for "
 				  << name << std::endl;
 			return nullptr;
 		}
+		ret = ::ioctl(alloc.fd, DMA_BUF_SET_NAME, name);
 
 		/* Map the buffer into user space. */
-		user_ptr = ::mmap(0, alloc.size, PROT_READ | PROT_WRITE,
-				  MAP_SHARED, alloc.handle, 0);
+		user_ptr = ::mmap(0, size, PROT_READ | PROT_WRITE,
+				  MAP_SHARED, alloc.fd, 0);
 
 		if (user_ptr == MAP_FAILED) {
-			std::cerr << "vcsm mmap failure for " << name << std::endl;
-			::close(alloc.handle);
+			std::cerr << "dmaheap mmap failure for " << name << std::endl;
+			::close(alloc.fd);
 			return nullptr;
 		}
 
 		std::lock_guard<std::mutex> lock(lock_);
-		allocMap_.emplace(user_ptr, AllocInfo(alloc.handle,
-						      alloc.size, alloc.vc_handle));
+		allocMap_.emplace(user_ptr, AllocInfo(alloc.fd,
+						      size));
 
 		return user_ptr;
 	}
@@ -92,26 +97,25 @@ public:
 		remove(user_ptr);
 	}
 
-	unsigned int getVCHandle(void *user_ptr)
+	unsigned int getHandle(void *user_ptr)
 	{
 		std::lock_guard<std::mutex> lock(lock_);
 		auto it = allocMap_.find(user_ptr);
 		if (it != allocMap_.end())
-			return it->second.vcHandle;
+			return it->second.handle;
 
 		return 0;
 	}
 
 private:
 	struct AllocInfo {
-		AllocInfo(int handle_, int size_, int vcHandle_)
-			: handle(handle_), size(size_), vcHandle(vcHandle_)
+		AllocInfo(int handle_, int size_)
+			: handle(handle_), size(size_)
 		{
 		}
 
 		int handle;
 		int size;
-		uint32_t vcHandle;
 	};
 
 	/* Map of all allocations that have been requested. */
@@ -137,7 +141,7 @@ private:
 	}
 
 	AllocMap allocMap_;
-	int vcsmHandle_;
+	int dmaheapHandle_;
 	std::mutex lock_;
 };
 
